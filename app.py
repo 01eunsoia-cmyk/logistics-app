@@ -19,6 +19,43 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# 모바일에서 상단 네비게이션 3개 버튼이 세로로 떨어지지 않도록 고정
+st.markdown(
+    """
+    <style>
+    .st-key-top_nav [data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        gap: 0.45rem !important;
+    }
+    .st-key-top_nav [data-testid="column"] {
+        flex: 1 1 0 !important;
+        width: 33.333% !important;
+        min-width: 0 !important;
+    }
+    .st-key-top_nav button {
+        width: 100% !important;
+        min-height: 3rem !important;
+        padding: 0.2rem 0.35rem !important;
+        font-size: 1.15rem !important;
+    }
+    @media (max-width: 768px) {
+        .st-key-top_nav [data-testid="stHorizontalBlock"] {
+            gap: 0.35rem !important;
+        }
+        .st-key-top_nav button {
+            min-height: 3.2rem !important;
+        }
+        [data-testid="stDataFrame"] {
+            font-size: 0.82rem !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 # 내부 서버/Docker에서는 APP_DATA_DIR을 영구 볼륨 경로로 지정 가능
 DATA_DIR = Path(os.getenv("APP_DATA_DIR", str(BASE_DIR / "data")))
@@ -102,6 +139,7 @@ def init_session_state():
         "main_category": "",
         "sub_category": "",
         "selected_group": None,
+        "table_nonce": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -328,6 +366,8 @@ def build_unified_data(shipping: pd.DataFrame, picking: pd.DataFrame, dispatch: 
             "출고처명(거래처)",
             "배송처주소",
             "차량번호",
+            "차량기사",
+            "연락처",
             "품목코드",
             "SIZE",
             "PTTN",
@@ -437,24 +477,63 @@ def build_unified_data(shipping: pd.DataFrame, picking: pd.DataFrame, dispatch: 
     dispatch["상품코드"] = dispatch["품목코드"].map(clean_text)
     dispatch["사이즈"] = dispatch["SIZE"].map(clean_text)
     dispatch["패턴"] = dispatch["PTTN"].map(clean_text)
+    dispatch["기사명"] = dispatch["차량기사"].map(clean_text)
+    dispatch["연락처"] = dispatch["연락처"].map(clean_text)
     dispatch["수량"] = dispatch["배차수량"].where(dispatch["배차수량"] > 0, dispatch["총수량"])
+
+    # 원본에 해당 열이 생기면 자동으로 화면에 연결하고, 없으면 공란으로 둠
+    barcode_col = next((c for c in dispatch.columns if "바코드" in clean_text(c)), None)
+    winter_col = next(
+        (c for c in dispatch.columns if "윈터" in clean_text(c) or "winter" in clean_text(c).lower()),
+        None,
+    )
+    dispatch["바코드"] = dispatch[barcode_col].map(clean_text) if barcode_col else ""
+    dispatch["윈터"] = dispatch[winter_col].map(clean_text) if winter_col else ""
 
     def classify_status(row):
         vehicle = clean_text(row.get("차량번호"))
+        driver = clean_text(row.get("차량기사"))
         parcel = clean_text(row.get("택배구분"))
+        departure = clean_text(row.get("출고일시"))
 
-        if not vehicle:
+        # 업무 기준: 출고일시가 비어 있으면 무조건 미배차
+        if not departure:
             return "미배차"
+
+        # 임시 차량은 출고일시가 같은 건을 한 차량으로 취급
+        if "임의차량" in driver or "9999" in vehicle or not vehicle:
+            return "배차중"
+
         if parcel == "택배" or "택배" in vehicle:
             return "택배"
 
-        base_date = parse_date(row.get("예정일자")) or parse_date(row.get("출고일시"))
+        base_date = parse_date(row.get("예정일자")) or parse_date(departure)
         arrival_date = parse_date(row.get("예상도착일시"))
         if base_date and arrival_date:
             return "당착" if arrival_date <= base_date else "익착"
         return "미정"
 
     dispatch["상태"] = dispatch.apply(classify_status, axis=1)
+
+    def display_vehicle(row):
+        if row["상태"] == "미배차":
+            return "미배차"
+        if row["상태"] == "배차중":
+            return "배차중"
+        return clean_text(row.get("차량번호")) or "-"
+
+    def vehicle_group_key(row):
+        # 배차중은 차량번호 대신 출고일시를 차량 식별키로 사용
+        if row["상태"] == "배차중":
+            return f"배차중|{clean_text(row.get('출고일시'))}"
+        if row["상태"] == "미배차":
+            return f"미배차|{clean_text(row.get('점포명'))}|{clean_text(row.get('주소'))}"
+        return f"{clean_text(row.get('차량번호'))}|{clean_text(row.get('출고일시'))}"
+
+    dispatch["차량정보"] = dispatch.apply(display_vehicle, axis=1)
+    dispatch["_차량그룹키"] = dispatch.apply(vehicle_group_key, axis=1)
+    # 현재 원본의 피킹지출력 Y를 피킹내림 표시(○)로 사용
+    dispatch["피킹내림"] = dispatch["출력여부"].map(lambda v: "○" if clean_text(v) == "출력" else "")
 
     # 지원 대상 3개 분류만 화면에 노출
     dispatch = dispatch[dispatch["분류"].isin(["승용", "화물", "마케팅"])].copy()
@@ -479,6 +558,12 @@ def build_unified_data(shipping: pd.DataFrame, picking: pd.DataFrame, dispatch: 
         "일련번호",
         "품목비고",
         "운송장번호",
+        "기사명",
+        "연락처",
+        "차량정보",
+        "피킹내림",
+        "바코드",
+        "윈터",
     ]:
         if col not in dispatch.columns:
             dispatch[col] = ""
@@ -524,26 +609,34 @@ def logout():
 
 
 def render_top_nav(show_back=True):
-    col1, col2, col3, col4 = st.columns([5, 1, 1, 1])
-    with col1:
-        if st.button("🔄", help="최신 데이터 다시 불러오기"):
-            st.rerun()
-    with col2:
-        if st.button("🏠", help="홈으로"):
-            st.session_state.step = "home"
-            st.rerun()
-    with col3:
-        if show_back and st.button("⬅️", help="뒤로가기"):
-            if st.session_state.step == "detail":
-                st.session_state.step = "list"
-            elif st.session_state.step == "list":
-                st.session_state.step = "sub"
-            elif st.session_state.step == "sub":
+    # 모바일에서도 새로고침 / 홈 / 뒤로가기를 반드시 한 줄에 표시
+    with st.container(key="top_nav"):
+        col1, col2, col3 = st.columns(3, gap="small")
+        with col1:
+            if st.button("🔄", help="최신 데이터 다시 불러오기", use_container_width=True):
+                st.rerun()
+        with col2:
+            if st.button("🏠", help="홈으로", use_container_width=True):
                 st.session_state.step = "home"
-            st.rerun()
-    with col4:
-        if st.button("🚪", help="로그아웃"):
-            logout()
+                st.session_state.selected_group = None
+                st.session_state.table_nonce += 1
+                st.rerun()
+        with col3:
+            if st.button("⬅️", help="뒤로가기", use_container_width=True):
+                if st.session_state.step == "detail":
+                    st.session_state.step = "list"
+                    st.session_state.selected_group = None
+                    st.session_state.table_nonce += 1
+                    st.rerun()
+                elif st.session_state.step == "list":
+                    st.session_state.step = "sub"
+                    st.rerun()
+                elif st.session_state.step == "sub":
+                    st.session_state.step = "home"
+                    st.rerun()
+                else:
+                    # 홈에서 뒤로가기는 로그인 화면으로 돌아감
+                    logout()
     st.markdown("---")
 
 
@@ -604,8 +697,9 @@ def render_admin_panel():
 
         st.info(
             "현재 원본 기준: PSR=승용, TBR=화물, 마케팅=마케팅출고 / "
-            "택배구분=택배는 택배 메뉴 / 차량번호가 비어 있으면 미배차 / "
-            "예상도착일이 예정일과 같으면 당착, 이후면 익착으로 분류합니다."
+            "출고일시 공란=미배차 / 차량기사에 임의차량 또는 차량번호에 9999=배차중 / "
+            "배차중은 출고일시가 같으면 한 차량으로 묶습니다. "
+            "예상도착일이 예정일과 같으면 당착, 이후면 익착입니다."
         )
 
 
@@ -627,7 +721,10 @@ def group_for_list(filtered_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     group_cols = [
-        "차량번호",
+        "_차량그룹키",
+        "차량정보",
+        "기사명",
+        "연락처",
         "점포명",
         "주소",
         "상태",
@@ -641,29 +738,116 @@ def group_for_list(filtered_df: pd.DataFrame) -> pd.DataFrame:
         filtered_df.groupby(group_cols, dropna=False, as_index=False)
         .agg(
             수량=("수량", "sum"),
-            품목수=("상품코드", "nunique"),
-            라인수=("상품코드", "size"),
+            가지수=("상품코드", "nunique"),
+            바코드=("바코드", join_unique),
+            윈터=("윈터", join_unique),
+            비고=("품목비고", join_unique),
         )
-        .sort_values(["차량번호", "점포명"], na_position="last")
+        .sort_values(["_차량그룹키", "점포명"], na_position="last")
         .reset_index(drop=True)
+    )
+    grouped["피킹내림"] = grouped["출력여부"].map(
+        lambda v: "○" if clean_text(v) == "출력" else ""
     )
     return grouped
 
 
 def rows_for_selected_group(df: pd.DataFrame, group: dict) -> pd.DataFrame:
     result = df.copy()
-    for col in [
-        "차량번호",
-        "점포명",
-        "주소",
-        "상태",
-        "출력여부",
-        "출고일시",
-        "예정일자",
-        "예상도착일시",
-    ]:
+    # 한 배송처 행의 상세를 조회. 배차중은 동일 출고일시를 같은 차량키로 사용함.
+    for col in ["_차량그룹키", "점포명", "주소", "상태", "출고일시"]:
         result = result[result[col].map(clean_text) == clean_text(group.get(col))]
     return result.copy()
+
+
+def natural_location_key(value: str) -> str:
+    """A-2-10 같은 로케이션도 숫자 자릿수에 영향 없이 정렬되게 만든 키."""
+    import re
+
+    text = clean_text(value).upper()
+    return re.sub(r"\d+", lambda m: f"{int(m.group()):010d}", text)
+
+
+def build_picking_detail(picking: pd.DataFrame, selected_dispatch: pd.DataFrame) -> pd.DataFrame:
+    """선택 배송처의 원본 피킹행을 보존해 로케이션/DOT별 실제 피킹수량을 보여줌."""
+    if selected_dispatch.empty:
+        return pd.DataFrame()
+
+    pick = picking.copy() if not picking.empty else pd.DataFrame()
+    if not pick.empty:
+        pick = normalize_text_columns(
+            pick,
+            [
+                "일련번호",
+                "출고처명(거래처)",
+                "배송처주소",
+                "품목코드",
+                "SIZE",
+                "PTTN",
+                "로케이션",
+                "DOT",
+            ],
+        )
+        if "피킹수량" not in pick.columns:
+            pick["피킹수량"] = 0
+        pick["피킹수량"] = pd.to_numeric(pick["피킹수량"], errors="coerce").fillna(0)
+
+        serials = {
+            clean_text(v)
+            for v in selected_dispatch.get("일련번호", pd.Series(dtype=object))
+            if clean_text(v)
+        }
+        if serials:
+            matched = pick[pick["일련번호"].map(clean_text).isin(serials)].copy()
+        else:
+            stores = {clean_text(v) for v in selected_dispatch["점포명"] if clean_text(v)}
+            addresses = {clean_text(v) for v in selected_dispatch["주소"] if clean_text(v)}
+            matched = pick[
+                pick["출고처명(거래처)"].map(clean_text).isin(stores)
+                & pick["배송처주소"].map(clean_text).isin(addresses)
+            ].copy()
+
+        if not matched.empty:
+            matched = matched.rename(
+                columns={
+                    "품목코드": "상품코드",
+                    "피킹수량": "수량",
+                    "PTTN": "패턴",
+                    "SIZE": "사이즈",
+                }
+            )
+            result = (
+                matched.groupby(
+                    ["로케이션", "상품코드", "DOT", "패턴", "사이즈"],
+                    dropna=False,
+                    as_index=False,
+                )["수량"]
+                .sum()
+            )
+            result["_loc_sort"] = result["로케이션"].map(natural_location_key)
+            result = result.sort_values(
+                ["_loc_sort", "상품코드"],
+                ascending=[False, True],
+                na_position="last",
+            ).drop(columns=["_loc_sort"])
+            return result[["로케이션", "상품코드", "수량", "DOT", "패턴", "사이즈"]].reset_index(drop=True)
+
+    # 피킹조회 원본이 아직 없거나 매칭되지 않은 경우 배차 데이터로 최소 정보 표시
+    fallback = selected_dispatch[["로케이션", "상품코드", "수량", "DOT", "패턴", "사이즈"]].copy()
+    fallback = (
+        fallback.groupby(
+            ["로케이션", "상품코드", "DOT", "패턴", "사이즈"],
+            dropna=False,
+            as_index=False,
+        )["수량"]
+        .sum()
+    )
+    fallback["_loc_sort"] = fallback["로케이션"].map(natural_location_key)
+    return (
+        fallback.sort_values(["_loc_sort", "상품코드"], ascending=[False, True])
+        .drop(columns=["_loc_sort"])[["로케이션", "상품코드", "수량", "DOT", "패턴", "사이즈"]]
+        .reset_index(drop=True)
+    )
 
 
 # =========================================================
@@ -751,7 +935,7 @@ elif st.session_state.step == "sub":
     category_df = df[df["분류"] == category]
 
     if category in ["승용", "화물"]:
-        sub_menus = ["당착", "익착", "택배", "미배차"]
+        sub_menus = ["당착", "익착", "배차중", "택배", "미배차"]
         # 원본에 예상도착일이 비어 있는 배차가 있으면 누락시키지 않음
         if (category_df["상태"] == "미정").any():
             sub_menus.append("미정")
@@ -863,21 +1047,62 @@ elif st.session_state.step == "list":
     st.metric("조회 물량", f"{format_qty(total_qty)}개")
 
     grouped = group_for_list(filtered_df)
-    st.markdown(f"**배송처/차량 기준 {len(grouped):,}건** (눌러서 상품 상세조회)")
-    st.markdown("---")
+    st.markdown(f"**배송처 기준 {len(grouped):,}건**")
+    st.caption("행을 터치/클릭하면 품목별 피킹정보가 열립니다.")
 
     if grouped.empty:
         st.info("조건에 맞는 조회 결과가 없습니다.")
+        st.stop()
 
-    for idx, row in grouped.iterrows():
-        vehicle = clean_text(row["차량번호"]) or "미배차"
-        print_badge = "🟢" if clean_text(row["출력여부"]) == "출력" else "🟠"
-        card_label = (
-            f"{print_badge} {row['점포명']} | {vehicle} | "
-            f"{format_qty(row['수량'])}개 | {int(row['품목수'])}품목"
-        )
-        if st.button(card_label, key=f"group_{idx}", use_container_width=True):
-            st.session_state.selected_group = row.to_dict()
+    # 현장 양식과 동일한 순서로 배송처 목록 표시
+    table_df = grouped[[
+        "피킹내림",
+        "차량정보",
+        "기사명",
+        "연락처",
+        "점포명",
+        "주소",
+        "수량",
+        "가지수",
+        "바코드",
+        "윈터",
+        "비고",
+    ]].copy()
+    table_df = table_df.rename(
+        columns={
+            "점포명": "거래처명",
+            "주소": "배송처주소",
+        }
+    )
+
+    event = st.dataframe(
+        table_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(700, 42 + 36 * max(1, len(table_df))),
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"dispatch_table_{category}_{menu}_{st.session_state.table_nonce}",
+        column_config={
+            "피킹내림": st.column_config.TextColumn("피킹내림", width="small"),
+            "차량정보": st.column_config.TextColumn("차량정보", width="medium"),
+            "기사명": st.column_config.TextColumn("기사명", width="small"),
+            "연락처": st.column_config.TextColumn("연락처", width="medium"),
+            "거래처명": st.column_config.TextColumn("거래처명", width="large"),
+            "배송처주소": st.column_config.TextColumn("배송처주소", width="large"),
+            "수량": st.column_config.NumberColumn("수량", format="%d"),
+            "가지수": st.column_config.NumberColumn("가지수", format="%d"),
+            "바코드": st.column_config.TextColumn("바코드", width="small"),
+            "윈터": st.column_config.TextColumn("윈터", width="small"),
+            "비고": st.column_config.TextColumn("비고", width="medium"),
+        },
+    )
+
+    selected_rows = event.selection.rows if event and hasattr(event, "selection") else []
+    if selected_rows:
+        selected_idx = int(selected_rows[0])
+        if 0 <= selected_idx < len(grouped):
+            st.session_state.selected_group = grouped.iloc[selected_idx].to_dict()
             st.session_state.step = "detail"
             st.rerun()
 
@@ -904,7 +1129,7 @@ elif st.session_state.step == "detail":
         st.warning("현재 데이터에서 해당 항목을 찾지 못했습니다. 최신 데이터로 다시 조회해주세요.")
         st.stop()
 
-    vehicle = clean_text(group.get("차량번호")) or "미배차"
+    vehicle = clean_text(group.get("차량정보")) or "미배차"
     total_qty = detail_df["수량"].sum()
 
     st.info(f"**{clean_text(group.get('점포명'))}**")
@@ -912,7 +1137,11 @@ elif st.session_state.step == "detail":
     c1.metric("총 물량", f"{format_qty(total_qty)}개")
     c2.metric("품목", f"{detail_df['상품코드'].nunique():,}종")
 
-    st.markdown(f"• **차량번호:** {vehicle}")
+    st.markdown(f"• **차량정보:** {vehicle}")
+    if clean_text(group.get("기사명")):
+        st.markdown(f"• **기사명:** {clean_text(group.get('기사명'))}")
+    if clean_text(group.get("연락처")):
+        st.markdown(f"• **연락처:** {clean_text(group.get('연락처'))}")
     st.markdown(f"• **구분:** {clean_text(group.get('상태'))}")
     st.markdown(f"• **출력여부:** {clean_text(group.get('출력여부'))}")
     if clean_text(group.get("출고일시")):
@@ -922,25 +1151,23 @@ elif st.session_state.step == "detail":
     st.markdown(f"• **배송 주소:** {clean_text(group.get('주소'))}")
 
     st.markdown("---")
-    st.markdown("#### 📦 상품 / 로케이션")
+    st.markdown("#### 📦 품목별 피킹정보")
+    st.caption("로케이션 내림차순 → 품목코드 순")
 
-    display_cols = [
-        "상품코드",
-        "사이즈",
-        "패턴",
-        "수량",
-        "로케이션",
-        "DOT",
-        "운송장번호",
-        "품목비고",
-    ]
-    display_df = detail_df[display_cols].copy()
-    display_df = (
-        display_df.groupby(
-            ["상품코드", "사이즈", "패턴", "로케이션", "DOT", "운송장번호", "품목비고"],
-            dropna=False,
-            as_index=False,
-        )["수량"]
-        .sum()
-    )
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    picking_detail = build_picking_detail(picking_df, detail_df)
+    if picking_detail.empty:
+        st.info("표시할 피킹 상세정보가 없습니다.")
+    else:
+        st.dataframe(
+            picking_detail,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "로케이션": st.column_config.TextColumn("로케이션", width="medium"),
+                "상품코드": st.column_config.TextColumn("품목코드", width="medium"),
+                "수량": st.column_config.NumberColumn("수량", format="%d"),
+                "DOT": st.column_config.TextColumn("디오티", width="medium"),
+                "패턴": st.column_config.TextColumn("패턴", width="medium"),
+                "사이즈": st.column_config.TextColumn("사이즈", width="medium"),
+            },
+        )
